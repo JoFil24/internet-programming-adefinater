@@ -1,0 +1,15 @@
+#### 4. Data Validation (5 points)
+
+- Log console warnings for:
+  - Missing required fields
+  - Future broadcast dates
+  - Duplicate/invalid ranks
+  - Negative series numbers
+- Display warning count in UI
+
+#### 2. Keyboard Navigation (5 points)
+
+- Arrow keys: Navigate table rows
+- Enter: Sort by focused column
+- Tab/Shift+Tab: Move between filters
+- Visual feedback for current focus

@@ -25,7 +25,8 @@ let state = {
     },
     filters: {
         name: ''          // Current filter value
-    }
+    },
+    focusedRowIndex: -1   // Track keyboard-focused row
 };
 
 // Initialize Application
@@ -36,12 +37,29 @@ async function init() {
 
 // Event Listeners Setup
 function setupEventListeners() {
-    // TODO: Implement event listeners for:
-    // 1. Filter input changes
-    // 2. Column header clicks (sorting)
-    // 3. Additional filter changes
+    // Make table headers keyboard accessible
+    const headers = document.querySelectorAll('th[data-sort]');
+    headers.forEach(header => {
+        // Make header cells tabbable
+        header.tabIndex = 0;
+        
+        // Handle click for sorting
+        header.addEventListener('click', () => {
+            const field = header.dataset.sort;
+            sortEpisodes(field);
+        });
+        
+        // Handle keyboard for sorting
+        header.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                const field = header.dataset.sort;
+                sortEpisodes(field);
+            }
+        });
+    });
     
-    // Filter input listener
+    // Filter input listener with keyboard navigation
     const filterInput = document.getElementById('name-filter');
     if (filterInput) {
         filterInput.addEventListener('input', (e) => {
@@ -50,14 +68,8 @@ function setupEventListeners() {
         });
     }
 
-    // Column header click listeners
-    const headers = document.querySelectorAll('th[data-sort]');
-    headers.forEach(header => {
-        header.addEventListener('click', () => {
-            const field = header.dataset.sort;
-            sortEpisodes(field);
-        });
-    });
+    // Global keyboard navigation for table
+    document.addEventListener('keydown', handleTableNavigation);
 }
 
 // Data Loading
@@ -84,13 +96,20 @@ async function loadEpisodes() {
                 throw new Error('Data received is not in the expected format');
             }
         } else {
-            state.episodes = data;
-        }
+                state.episodes = data;
+            }
         
-    // Normalize episodes (add display and sort-friendly fields)
-    state.episodes = normalizeEpisodes(state.episodes);
-    state.filtered = [...state.episodes];
-    displayEpisodes(state.filtered);
+        // Normalize episodes (add display and sort-friendly fields)
+        state.episodes = normalizeEpisodes(state.episodes);
+
+        // Validate and filter out episodes with missing/invalid critical fields
+        const validated = validateEpisodes(state.episodes);
+        state.episodes = validated;
+
+        state.filtered = [...state.episodes];
+    // Update warnings UI (validateEpisodes populates state.warningCount/state.warnings)
+    updateWarningsUI();
+        displayEpisodes(state.filtered);
     } catch (error) {
         console.error('Error details:', error); // Debug log
         showError('Failed to load episodes: ' + error.message);
@@ -184,7 +203,7 @@ function normalizeEpisodes(episodes) {
         out._sort.doctor = doctorSort;
 
         // Companion (text)
-    let companionDisplay = 'N/A';
+    let companionDisplay = 'None';
     let companionSort = '';
         if (ep && ep.companion) {
             const actor = ep.companion.actor && ep.companion.actor.toString().trim();
@@ -194,7 +213,8 @@ function normalizeEpisodes(episodes) {
             const characterPart = character ? character : 'N/A';
             // If both are 'N/A' then show a single 'N/A'
             if (actorPart === 'N/A' && characterPart === 'N/A') {
-                companionDisplay = 'N/A';
+                // no companion info provided
+                companionDisplay = 'None';
                 companionSort = '';
             } else {
                 companionDisplay = `${actorPart} (${characterPart})`;
@@ -211,6 +231,92 @@ function normalizeEpisodes(episodes) {
 
         return out;
     });
+}
+
+// Validate episodes and exclude ones that don't meet the required criteria.
+// Exclusion criteria (per user request):
+// - missing title
+// - missing or negative series
+// - missing or negative rank
+// - duplicate ranks
+// - missing year (unparseable broadcast_date)
+// - missing director
+// - missing writer
+// - missing doctor or missing doctor.actor
+function validateEpisodes(episodes) {
+    if (!Array.isArray(episodes)) return [];
+
+    const kept = [];
+    const seenRanks = new Set();
+    let excluded = 0;
+    const warnings = [];
+
+    episodes.forEach(ep => {
+        const reasons = [];
+
+        // Title
+        const title = ep.title;
+        if (!title || String(title).trim() === '' || String(title) === 'N/A') reasons.push('missing title');
+
+    // Series: allow numeric series >= 0 or the special string 'special' (case-insensitive)
+    const seriesRaw = ep.series;
+    const isSpecialSeries = typeof seriesRaw === 'string' && seriesRaw.trim().toLowerCase() === 'special';
+    const seriesNum = Number(seriesRaw);
+    if (!(isSpecialSeries || (Number.isFinite(seriesNum) && seriesNum >= 0))) reasons.push('missing/negative series');
+
+        // Rank
+        const rankNum = Number(ep.rank);
+        if (!Number.isFinite(rankNum) || rankNum < 0) {
+            reasons.push('missing/negative rank');
+        } else {
+            // Duplicate rank handling: keep the first encountered, exclude later ones
+            if (seenRanks.has(rankNum)) {
+                reasons.push('duplicate rank');
+            }
+        }
+
+        // Broadcast year
+        const rawDate = ep.broadcast_date || ep.broadcastDate;
+        const ts = parseDateToTimestamp(rawDate);
+        if (!Number.isFinite(ts)) {
+            reasons.push('missing year');
+        } else {
+            // Future broadcast date warning (do not exclude)
+            const now = Date.now();
+            if (ts > now) {
+                const msg = `Future broadcast date for rank=${ep.rank} title=${ep.title || '<no title>'}: ${rawDate}`;
+                console.warn(msg);
+                warnings.push(msg);
+            }
+        }
+
+        // Director
+        if (!ep.director || String(ep.director).trim() === '' || (ep._display && ep._display.director === 'N/A')) reasons.push('missing director');
+
+        // Writer
+        if (!ep.writer || String(ep.writer).trim() === '' || (ep._display && ep._display.writer === 'N/A')) reasons.push('missing writer');
+
+        // Doctor actor
+        if (!ep.doctor || !ep.doctor.actor || String(ep.doctor.actor).trim() === '') reasons.push('missing doctor/actor');
+
+        if (reasons.length > 0) {
+            excluded++;
+            const warnMsg = `Excluding episode rank=${ep.rank} title=${ep.title || '<no title>'}: ${reasons.join(', ')}`;
+            console.warn(warnMsg);
+            warnings.push(warnMsg);
+        } else {
+            // mark seen rank and keep this episode
+            seenRanks.add(Number(ep.rank));
+            kept.push(ep);
+        }
+    });
+
+    // Store warnings on state so UI can show a count
+    state.warnings = warnings;
+    state.warningCount = warnings.length;
+
+    console.info(`validateEpisodes: kept=${kept.length} excluded=${excluded} warnings=${warnings.length}`);
+    return kept;
 }
 
 // Display Functions
@@ -394,6 +500,151 @@ function showError(message) {
     const errorElement = document.getElementById('error');
     errorElement.textContent = message;
     errorElement.style.display = message ? 'block' : 'none';
+}
+
+// Update warnings UI element with the current warning count and details (in title)
+function updateWarningsUI() {
+    const el = document.getElementById('warnings');
+    const detailsContainer = document.getElementById('warnings-details');
+    const listEl = document.getElementById('warnings-list');
+    if (!el || !detailsContainer || !listEl) return;
+
+    const warnings = Array.isArray(state.warnings) ? state.warnings : [];
+    const count = warnings.length;
+
+    if (count > 0) {
+        el.textContent = `Warnings: ${count}`;
+        // Keep a short tooltip too
+        const details = warnings.join('\n');
+        el.title = details.length > 2000 ? details.slice(0, 2000) + '...' : details;
+        el.style.display = 'inline-block';
+
+        // Populate the warnings list
+        listEl.innerHTML = '';
+        warnings.forEach((w, idx) => {
+            const li = document.createElement('li');
+            li.textContent = w;
+            li.title = w;
+            li.setAttribute('data-warning-index', String(idx));
+            listEl.appendChild(li);
+        });
+
+        // Hide details by default
+        detailsContainer.style.display = 'none';
+
+        // Attach click/keyboard handlers once to toggle details
+        if (!el.dataset.warnHandlersAttached) {
+            el.tabIndex = 0; // make focusable
+            el.style.cursor = 'pointer';
+
+            const toggle = (ev) => {
+                // Toggle visibility
+                const isHidden = detailsContainer.style.display === 'none' || detailsContainer.style.display === '';
+                detailsContainer.style.display = isHidden ? 'block' : 'none';
+                // Update aria-expanded for accessibility
+                try {
+                    el.setAttribute('aria-expanded', isHidden ? 'true' : 'false');
+                } catch (e) {
+                    // ignore
+                }
+            };
+
+            el.addEventListener('click', toggle);
+            el.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    toggle();
+                }
+            });
+
+            el.dataset.warnHandlersAttached = '1';
+        }
+    } else {
+        // No warnings: hide both count and details
+        el.textContent = '';
+        el.title = '';
+        el.style.display = 'none';
+        detailsContainer.style.display = 'none';
+        listEl.innerHTML = '';
+    }
+}
+
+// Handle keyboard navigation for the table
+function handleTableNavigation(e) {
+    const tbody = document.querySelector('#episodes-table tbody');
+    if (!tbody || state.loading) return;
+
+    // Only handle navigation when table is visible
+    const table = document.getElementById('episodes-table');
+    if (table.style.display === 'none') return;
+
+    const rows = Array.from(tbody.children);
+    if (rows.length === 0) return;
+
+    // When no row is focused, start from first or last based on key
+    if (state.focusedRowIndex === -1) {
+        if (e.key === 'ArrowDown' || e.key === 'Home') {
+            state.focusedRowIndex = 0;
+            updateRowFocus();
+            return;
+        } else if (e.key === 'ArrowUp' || e.key === 'End') {
+            state.focusedRowIndex = rows.length - 1;
+            updateRowFocus();
+            return;
+        }
+    }
+
+    switch (e.key) {
+        case 'ArrowDown':
+            e.preventDefault();
+            if (state.focusedRowIndex < rows.length - 1) {
+                state.focusedRowIndex++;
+                updateRowFocus();
+            }
+            break;
+        case 'ArrowUp':
+            e.preventDefault();
+            if (state.focusedRowIndex > 0) {
+                state.focusedRowIndex--;
+                updateRowFocus();
+            }
+            break;
+        case 'Home':
+            e.preventDefault();
+            state.focusedRowIndex = 0;
+            updateRowFocus();
+            break;
+        case 'End':
+            e.preventDefault();
+            state.focusedRowIndex = rows.length - 1;
+            updateRowFocus();
+            break;
+        case 'Tab':
+            // Clear row focus when tabbing away
+            if (state.focusedRowIndex !== -1) {
+                state.focusedRowIndex = -1;
+                updateRowFocus();
+            }
+            break;
+    }
+}
+
+// Helper to update row focus state and ensure keyboard focus
+function updateRowFocus() {
+    const tbody = document.querySelector('#episodes-table tbody');
+    if (!tbody) return;
+
+    Array.from(tbody.children).forEach((row, index) => {
+        // Make rows focusable but not in tab order
+        row.tabIndex = index === state.focusedRowIndex ? 0 : -1;
+        row.setAttribute('data-focused', index === state.focusedRowIndex ? 'true' : 'false');
+        
+        if (index === state.focusedRowIndex) {
+            row.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            // Set actual keyboard focus
+            row.focus();
+        }
+    });
 }
 
 document.addEventListener('DOMContentLoaded', init);
